@@ -10,8 +10,11 @@ __pycache__/
 # C extensions
 *.so
 
-# Custom folders
+# Custom folders/files
 data/
+*.keras
+*.tflite
+
 
 # Distribution / packaging
 .Python

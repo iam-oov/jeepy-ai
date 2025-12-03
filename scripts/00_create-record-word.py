@@ -16,8 +16,8 @@ ENERGY_THRESHOLD = 500  # Nivel de energía para empezar a grabar (ajusta este v
 SILENCE_CHUNKS = int(MAX_SILENCE_DURATION * RATE / CHUNK)
 
 # --- RUTAS DE SALIDA ---
-OUTPUT_DIR_POSITIVE = "data/jeepy_positive"
-OUTPUT_DIR_NEGATIVE = "data/jeepy_negative"
+OUTPUT_POSITIVE_DIR = "data/jeepy_positive"
+OUTPUT_NEGATIVE_DIR = "data/jeepy_negative"
 
 
 def get_input_device_index():
@@ -100,8 +100,8 @@ def record_jeepy_sample(device_index, output_dir: str):
 if __name__ == "__main__":
     # Crea la estructura de carpetas
     os.makedirs("data", exist_ok=True)
-    os.makedirs(OUTPUT_DIR_POSITIVE, exist_ok=True)
-    os.makedirs(OUTPUT_DIR_NEGATIVE, exist_ok=True)
+    os.makedirs(OUTPUT_POSITIVE_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_NEGATIVE_DIR, exist_ok=True)
 
     mic_index = get_input_device_index()
 
@@ -113,9 +113,9 @@ if __name__ == "__main__":
 
     while True:
         if mode == "P":
-            record_jeepy_sample(mic_index, OUTPUT_DIR_POSITIVE)
+            record_jeepy_sample(mic_index, OUTPUT_POSITIVE_DIR)
         elif mode == "N":
-            record_jeepy_sample(mic_index, OUTPUT_DIR_NEGATIVE)
+            record_jeepy_sample(mic_index, OUTPUT_NEGATIVE_DIR)
         elif mode == "Q":
             print("Saliendo del grabador. ¡Éxito con tu entrenamiento!")
             break
