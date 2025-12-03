@@ -14,6 +14,16 @@ __pycache__/
 data/
 *.keras
 *.tflite
+.env
+*.log
+kws_monitor.log
+debug_audio/
+captured_commands/*.wav
+models/
+credentials/
+secrets/
+transcriptions/
+interpretations/
 
 
 # Distribution / packaging

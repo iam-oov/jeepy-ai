@@ -7,9 +7,40 @@ import logging
 import json
 from datetime import datetime
 import os
+import sys
 import threading
 import queue
 import psutil
+
+# Agregar directorio raíz al path para imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Imports de módulos de integración
+try:
+    from config import Config
+    from stt_engine import STTManager
+
+    STT_ENABLED = True
+    print("✅ Módulos STT cargados")
+except ImportError as e:
+    STT_ENABLED = False
+    print(f"⚠️ STT no disponible: {e}")
+
+try:
+    from gemini_engine import GeminiEngine, VehicleController
+
+    GEMINI_ENABLED = True
+    print("✅ Módulos Gemini cargados")
+except ImportError as e:
+    GEMINI_ENABLED = False
+    print(f"⚠️ Gemini no disponible: {e}")
+
+if STT_ENABLED and GEMINI_ENABLED:
+    print("🎉 Pipeline completo: KWS → STT → Gemini → Acción")
+elif STT_ENABLED:
+    print("ℹ️  Pipeline parcial: KWS → STT")
+else:
+    print("ℹ️  Modo básico: KWS únicamente")
 
 # --- CONFIGURACIÓN DEL MODELO Y AUDIO ---
 TFLITE_MODEL_PATH = "jeepy_kws_model_quantized.tflite"
@@ -53,8 +84,102 @@ VAD_INITIAL_THRESHOLD_RMS = 0.005  # Umbral inicial de energía para detectar vo
 QUEUE_SIZE = 20  # Tamaño de la cola de audio (aprox 5 segundos)
 CPU_MONITOR_INTERVAL = 2.0  # Segundos entre lecturas de CPU
 
+# --- CONFIGURACIÓN DE GRABACIÓN DE COMANDOS ---
+RECORDING_SILENCE_THRESHOLD_MULTIPLIER = (
+    2.0  # Multiplicador del noise_floor para detectar silencio
+)
+RECORDING_SILENCE_DURATION_SEC = (
+    1.5  # Segundos de silencio continuo para terminar grabación
+)
+RECORDING_MAX_DURATION_SEC = 10.0  # Duración máxima de grabación (safety timeout)
+RECORDING_MIN_DURATION_SEC = (
+    0.5  # Duración mínima antes de permitir finalización por silencio
+)
+CAPTURED_COMMANDS_DIR = "./captured_commands/"
+
+# --- CONFIGURACIÓN FASE 4: ROBUSTEZ ---
+MAX_INFERENCE_RETRIES = 3  # Número de reintentos ante errores de inferencia
+MICROPHONE_RECONNECT_DELAY = 2.0  # Segundos antes de reintentar conexión al micrófono
+MAX_MICROPHONE_RECONNECT_ATTEMPTS = 5  # Intentos de reconexión antes de abortar
+ERROR_RECOVERY_COOLDOWN = 1.0  # Cooldown después de errores para evitar spam
+AUDIO_CHUNK_TIMEOUT = 2.0  # Timeout para detectar micrófono congelado
+
+# --- CONFIGURACIÓN FASE 5: UX AVANZADO ---
+ENABLE_CONTROL_COMMANDS = True  # Habilitar comandos de control ("Jeepy, detente")
+CONTROL_COMMANDS = {
+    "detente": "stop",
+    "para": "stop",
+    "pausa": "pause",
+    "continua": "resume",
+    "continúa": "resume",
+    "recalibrar": "recalibrate",
+    "calibrar": "recalibrate",
+    "estado": "status",
+    "estadísticas": "stats",
+}
+ENABLE_INTERACTIVE_MODE = True  # Permitir entrada de texto manual (desarrollo)
+LED_PATTERN_MONITORING = "slow_pulse"  # Patrón LED en modo monitoring
+LED_PATTERN_RECORDING = "solid"  # Patrón LED durante grabación
+LED_PATTERN_ERROR = "fast_blink"  # Patrón LED en error
+
+# --- CONFIGURACIÓN DE INTEGRACIÓN STT ---
+ENABLE_STT_PROCESSING = True  # Habilitar transcripción automática de comandos
+STT_AUTO_DELETE_AUDIO = True  # Eliminar WAV después de transcribir
+STT_SAVE_TRANSCRIPTIONS = True  # Guardar transcripciones en archivo
+TRANSCRIPTIONS_DIR = "./transcriptions/"  # Directorio para transcripciones
+
+# --- CONFIGURACIÓN DE INTEGRACIÓN GEMINI ---
+ENABLE_GEMINI_NLU = True  # Habilitar interpretación de comandos con Gemini
+GEMINI_AUTO_EXECUTE = True  # Ejecutar automáticamente acciones interpretadas
+GEMINI_SAVE_RESULTS = True  # Guardar resultados de interpretación
+INTERPRETATIONS_DIR = "./interpretations/"  # Directorio para resultados Gemini
+
+# --- ESTADOS DEL SISTEMA ---
+STATE_MONITORING = "monitoring"
+STATE_RECORDING = "recording"
+STATE_PROCESSING = "processing"
+STATE_TRANSCRIBING = "transcribing"  # Estado para STT
+STATE_PROCESSING_NLU = "processing_nlu"  # Estado para Gemini NLU
+STATE_ERROR = "error"
+STATE_PAUSED = "paused"
+
 
 # --- CLASES DE MEJORA ---
+
+
+class ErrorRecoveryManager:
+    """Gestiona reintentos y recuperación ante errores"""
+
+    def __init__(self, max_retries=MAX_INFERENCE_RETRIES):
+        self.max_retries = max_retries
+        self.error_counts = {}
+        self.last_error_time = {}
+
+    def should_retry(self, error_type):
+        """Determina si se debe reintentar ante un error"""
+        current_time = time.time()
+
+        # Resetear contador si pasó el cooldown
+        if error_type in self.last_error_time:
+            if (
+                current_time - self.last_error_time[error_type]
+                > ERROR_RECOVERY_COOLDOWN
+            ):
+                self.error_counts[error_type] = 0
+
+        # Incrementar contador
+        self.error_counts[error_type] = self.error_counts.get(error_type, 0) + 1
+        self.last_error_time[error_type] = current_time
+
+        return self.error_counts[error_type] <= self.max_retries
+
+    def reset(self, error_type):
+        """Resetea contador de errores exitosamente recuperados"""
+        self.error_counts[error_type] = 0
+
+    def get_error_count(self, error_type):
+        """Obtiene contador de errores"""
+        return self.error_counts.get(error_type, 0)
 
 
 class AudioChunk:
@@ -75,6 +200,10 @@ class SystemState:
         self.last_prediction = 0.0
         self.is_speaking = False
         self.noise_level = 0.0
+        self.current_state = STATE_MONITORING  # Estado del sistema
+        self.paused = False
+        self.control_command = None  # Para comunicación de comandos de control
+        self.last_error = None
         self.lock = threading.Lock()
 
     def update_metrics(self, fps=None, cpu=None, pred=None, speaking=None, noise=None):
@@ -90,62 +219,225 @@ class SystemState:
             if noise is not None:
                 self.noise_level = noise
 
+    def set_state(self, state):
+        with self.lock:
+            self.current_state = state
+
+    def get_state(self):
+        with self.lock:
+            return self.current_state
+
+    def set_paused(self, paused):
+        with self.lock:
+            self.paused = paused
+
+    def is_paused(self):
+        with self.lock:
+            return self.paused
+
+    def send_control_command(self, command):
+        """Envía comando de control al sistema"""
+        with self.lock:
+            self.control_command = command
+
+    def get_control_command(self):
+        """Obtiene y limpia comando de control pendiente"""
+        with self.lock:
+            cmd = self.control_command
+            self.control_command = None
+            return cmd
+
+    def set_error(self, error_msg):
+        with self.lock:
+            self.last_error = error_msg
+            self.current_state = STATE_ERROR
+
     def get_status_string(self):
         with self.lock:
             vad_state = "🗣️" if self.is_speaking else ".."
-            return f"CPU: {self.cpu_usage:4.1f}% | FPS: {self.fps:4.1f} | VAD: {vad_state} | Conf: {self.last_prediction:.4f} | Noise: {self.noise_level:.4f}"
+            state_icons = {
+                STATE_MONITORING: "👀",
+                STATE_RECORDING: "🔴",
+                STATE_PROCESSING: "⚙️",
+                STATE_TRANSCRIBING: "📝",
+                STATE_PROCESSING_NLU: "🤖",
+                STATE_ERROR: "❌",
+                STATE_PAUSED: "⏸️",
+            }
+            state_icon = state_icons.get(self.current_state, "❓")
+            pause_marker = " [PAUSADO]" if self.paused else ""
+            return f"{state_icon} CPU: {self.cpu_usage:4.1f}% | FPS: {self.fps:4.1f} | VAD: {vad_state} | Conf: {self.last_prediction:.4f} | Noise: {self.noise_level:.4f}{pause_marker}"
 
 
 class AudioCaptureThread(threading.Thread):
-    """Hilo productor: Captura audio y calcula RMS"""
+    """Hilo productor: Captura audio con reconexión automática"""
 
-    def __init__(self, device_index, queue, stop_event):
+    def __init__(self, device_index, queue, stop_event, system_state):
         super().__init__()
         self.device_index = device_index
         self.queue = queue
         self.stop_event = stop_event
+        self.state = system_state
         self.daemon = True
+        self.last_chunk_time = time.time()
 
-    def run(self):
-        p = pyaudio.PyAudio()
+    def _open_stream(self, p):
+        """Abre stream de audio con manejo de errores"""
         try:
             stream = p.open(
                 format=FORMAT,
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
-                frames_per_buffer=STRIDE_SIZE,
                 input_device_index=self.device_index,
+                frames_per_buffer=STRIDE_SIZE,
             )
+            print(f"✓ Captura de audio iniciada (dispositivo {self.device_index})")
+            return stream
+        except Exception as e:
+            print(f"❌ Error al abrir micrófono: {e}")
+            return None
 
-            while not self.stop_event.is_set():
-                try:
-                    data = stream.read(STRIDE_SIZE, exception_on_overflow=False)
-                    np_data = np.frombuffer(data, dtype=np.float32)
+    def run(self):
+        p = pyaudio.PyAudio()
+        reconnect_attempts = 0
 
-                    # Calcular RMS para VAD
-                    rms = np.sqrt(np.mean(np_data**2))
+        while (
+            not self.stop_event.is_set()
+            and reconnect_attempts < MAX_MICROPHONE_RECONNECT_ATTEMPTS
+        ):
+            stream = self._open_stream(p)
+            if not stream:
+                reconnect_attempts += 1
+                print(
+                    f"Reintentando en {MICROPHONE_RECONNECT_DELAY}s... ({reconnect_attempts}/{MAX_MICROPHONE_RECONNECT_ATTEMPTS})"
+                )
+                time.sleep(MICROPHONE_RECONNECT_DELAY)
+                continue
 
-                    chunk = AudioChunk(np_data, time.time(), rms)
+            reconnect_attempts = 0  # Resetear si conexión exitosa
+
+            try:
+                while not self.stop_event.is_set():
+                    # Verificar timeout de micrófono congelado
+                    if time.time() - self.last_chunk_time > AUDIO_CHUNK_TIMEOUT:
+                        print("⚠ Timeout: micrófono congelado, reconectando...")
+                        self.state.set_error("Micrófono congelado")
+                        break
 
                     try:
-                        self.queue.put(chunk, block=False)
-                    except queue.Full:
-                        # Drop frame strategy: sacar el viejo y poner el nuevo
+                        data = stream.read(STRIDE_SIZE, exception_on_overflow=False)
+                        np_data = np.frombuffer(data, dtype=np.float32)
+                        self.last_chunk_time = time.time()
+
+                        rms = np.sqrt(np.mean(np_data**2))
+                        chunk = AudioChunk(np_data, time.time(), rms)
+
                         try:
-                            self.queue.get_nowait()
                             self.queue.put(chunk, block=False)
-                        except:
-                            pass  # Queue contention edge case
+                        except queue.Full:
+                            # Drop oldest frame
+                            try:
+                                self.queue.get_nowait()
+                                self.queue.put(chunk, block=False)
+                            except:
+                                pass
 
-                except Exception as e:
-                    print(f"Error captura audio: {e}")
-                    break
+                    except IOError as e:
+                        print(f"⚠ Error I/O: {e}, reconectando...")
+                        self.state.set_error(f"Error I/O: {e}")
+                        break
 
-        finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
+            except Exception as e:
+                print(f"❌ Error inesperado: {e}")
+                self.state.set_error(f"Error captura: {e}")
+            finally:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
+
+            if not self.stop_event.is_set():
+                reconnect_attempts += 1
+                if reconnect_attempts < MAX_MICROPHONE_RECONNECT_ATTEMPTS:
+                    print(
+                        f"Reconectando en {MICROPHONE_RECONNECT_DELAY}s... ({reconnect_attempts}/{MAX_MICROPHONE_RECONNECT_ATTEMPTS})"
+                    )
+                    time.sleep(MICROPHONE_RECONNECT_DELAY)
+
+        p.terminate()
+        if reconnect_attempts >= MAX_MICROPHONE_RECONNECT_ATTEMPTS:
+            print("❌ Máximo de reconexiones alcanzado")
+            self.state.set_error("Máximo de reconexiones")
+        else:
+            print("✓ Captura detenida")
+
+
+class FeedbackManager:
+    """Gestiona feedback de usuario (sonidos y GPIO)"""
+
+    def __init__(self):
+        self.has_gpio = False
+        try:
+            import RPi.GPIO as GPIO
+
+            self.GPIO = GPIO
+            self.has_gpio = True
+            self.LED_PIN = 17
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(self.LED_PIN, GPIO.OUT)
+            GPIO.output(self.LED_PIN, GPIO.LOW)
+        except ImportError:
+            pass  # Modo simulación en PC
+
+    def _play_sound(self, message):
+        """Reproduce un beep o mensaje (simulado en PC)"""
+        print(f"\n🔔 {message}")
+        # En Raspberry Pi con archivos de sonido reales:
+        # subprocess.Popen(['aplay', '-q', f'assets/sounds/{sound_file}.wav'])
+
+    def signal_listening(self):
+        """Señal de inicio de grabación"""
+        if self.has_gpio:
+            self.GPIO.output(self.LED_PIN, self.GPIO.HIGH)
+        self._play_sound("INICIO DE GRABACIÓN")
+
+    def signal_processing(self):
+        """Señal de fin de grabación"""
+        if self.has_gpio:
+            self.GPIO.output(self.LED_PIN, self.GPIO.LOW)
+        self._play_sound("FIN DE GRABACIÓN")
+
+    def signal_error(self):
+        """Señal de error del sistema"""
+        self._play_sound("ERROR DEL SISTEMA")
+        # Parpadeo rápido en GPIO si está disponible
+        if self.has_gpio:
+            for _ in range(3):
+                self.GPIO.output(self.LED_PIN, self.GPIO.HIGH)
+                time.sleep(0.1)
+                self.GPIO.output(self.LED_PIN, self.GPIO.LOW)
+                time.sleep(0.1)
+
+    def cleanup(self):
+        """Limpieza de recursos GPIO"""
+        if self.has_gpio:
+            self.GPIO.cleanup()
+
+
+def save_wav_file(audio_data, filename, sample_rate=SAMPLE_RATE):
+    """Guarda audio en formato WAV"""
+    import wave
+
+    # Convertir float32 a int16
+    audio_int16 = (audio_data * 32767).astype(np.int16)
+
+    with wave.open(filename, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 2 bytes = 16 bits
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_int16.tobytes())
 
 
 class InferenceThread(threading.Thread):
@@ -163,6 +455,7 @@ class InferenceThread(threading.Thread):
         # Inicializar componentes en este hilo
         interpreter, input_details, output_details = initialize_tflite_interpreter()
         if not interpreter:
+            self.state.set_state(STATE_ERROR)
             return
 
         sliding_buffer = SlidingWindowBuffer(WINDOW_SIZE, STRIDE_SIZE)
@@ -173,80 +466,443 @@ class InferenceThread(threading.Thread):
             CONFIRMATION_COUNT, CONFIRMATION_WINDOW_MS
         )
         stats = KWSStatistics()
+        feedback = FeedbackManager()
+        error_manager = ErrorRecoveryManager()
+
+        # Inicializar STT Manager
+        if STT_ENABLED and ENABLE_STT_PROCESSING:
+            try:
+                self.stt_manager = STTManager()
+                self.logger.info(f"STT Manager inicializado: {Config.STT_ENGINE}")
+                print(f"🎤 STT habilitado: {Config.STT_ENGINE}")
+            except Exception as e:
+                self.logger.error(f"Error inicializando STT: {e}")
+                print(f"⚠️ STT no disponible: {e}")
+                self.stt_manager = None
+        else:
+            self.stt_manager = None
+            if not STT_ENABLED:
+                print("ℹ️ STT deshabilitado (módulos no disponibles)")
+
+        # Inicializar Gemini Engine y Vehicle Controller
+        if GEMINI_ENABLED and ENABLE_GEMINI_NLU:
+            try:
+                self.gemini_engine = GeminiEngine()
+                self.vehicle_controller = VehicleController()
+                self.logger.info(f"Gemini NLU inicializado: {Config.GEMINI_MODEL}")
+                print(f"🤖 Gemini habilitado: {Config.GEMINI_MODEL}")
+            except Exception as e:
+                self.logger.error(f"Error inicializando Gemini: {e}")
+                print(f"⚠️ Gemini no disponible: {e}")
+                self.gemini_engine = None
+                self.vehicle_controller = None
+        else:
+            self.gemini_engine = None
+            self.vehicle_controller = None
+            if not GEMINI_ENABLED:
+                print("ℹ️ Gemini deshabilitado (módulos no disponibles)")
 
         # Variables para VAD y métricas
         noise_floor = VAD_INITIAL_THRESHOLD_RMS
         vad_threshold = VAD_INITIAL_THRESHOLD_RMS * 1.5
         inference_count_window = []
 
+        # Variables para grabación
+        recording_buffer = []
+        recording_start_time = 0
+        silence_start_time = None
+        silence_chunks_count = 0
+
+        # Crear directorio de comandos capturados
+        os.makedirs(CAPTURED_COMMANDS_DIR, exist_ok=True)
+
+        # Crear directorio de transcripciones si STT está habilitado
+        if STT_ENABLED and STT_SAVE_TRANSCRIPTIONS:
+            os.makedirs(TRANSCRIPTIONS_DIR, exist_ok=True)
+
         while not self.stop_event.is_set():
+            # Verificar comandos de control
+            control_cmd = self.state.get_control_command()
+            if control_cmd:
+                self._handle_control_command(
+                    control_cmd, stats, confirmation_tracker, feedback
+                )
+                continue
+
+            # Verificar si está pausado
+            if self.state.is_paused():
+                time.sleep(0.1)
+                continue
+
             try:
                 chunk = self.queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
-            # 1. Actualizar buffers
-            sliding_buffer.add_samples(chunk.data)
-            pre_activation_buffer.write(chunk.data)
+            current_time = time.time()
+            current_state = self.state.get_state()
 
-            # 2. Lógica VAD y Ruido Adaptativo
-            # Actualizar piso de ruido (promedio exponencial lento)
-            noise_floor = (0.95 * noise_floor) + (0.05 * chunk.rms)
-            vad_threshold = noise_floor * 1.5  # Umbral dinámico simple
+            # === ESTADO: MONITORING ===
+            if current_state == STATE_MONITORING:
+                # 1. Actualizar buffers
+                sliding_buffer.add_samples(chunk.data)
+                pre_activation_buffer.write(chunk.data)
 
-            is_speaking = chunk.rms > vad_threshold
-            self.state.update_metrics(noise=noise_floor, speaking=is_speaking)
+                # 2. Lógica VAD y Ruido Adaptativo
+                noise_floor = (0.95 * noise_floor) + (0.05 * chunk.rms)
+                vad_threshold = noise_floor * 1.5
 
-            # Si es silencio absoluto, saltar inferencia (ahorro CPU)
-            if not is_speaking and chunk.rms < VAD_INITIAL_THRESHOLD_RMS:
-                self.state.update_metrics(pred=0.0)
-                continue
+                is_speaking = chunk.rms > vad_threshold
+                self.state.update_metrics(noise=noise_floor, speaking=is_speaking)
 
-            if not sliding_buffer.is_ready():
-                continue
+                # Si es silencio absoluto, saltar inferencia (ahorro CPU)
+                if not is_speaking and chunk.rms < VAD_INITIAL_THRESHOLD_RMS:
+                    self.state.update_metrics(pred=0.0)
+                    continue
 
-            # 3. Inferencia
-            window = sliding_buffer.get_window()
-            mfccs_input = extract_mfcc(window)
+                if not sliding_buffer.is_ready():
+                    continue
 
-            if mfccs_input is not None:
-                start_time = time.time()
-                interpreter.set_tensor(input_details[0]["index"], mfccs_input)
-                interpreter.invoke()
-                output_data = interpreter.get_tensor(output_details[0]["index"])
-                prob = output_data[0][0]
-                inf_time = time.time() - start_time
+                # 3. Inferencia
+                window = sliding_buffer.get_window()
+                mfccs_input = extract_mfcc(window)
 
-                # Métricas FPS
-                now = time.time()
-                inference_count_window.append(now)
-                inference_count_window = [
-                    t for t in inference_count_window if now - t < 1.0
-                ]
-                fps = len(inference_count_window)
+                if mfccs_input is not None:
+                    start_time = time.time()
+                    interpreter.set_tensor(input_details[0]["index"], mfccs_input)
+                    interpreter.invoke()
+                    output_data = interpreter.get_tensor(output_details[0]["index"])
+                    prob = output_data[0][0]
+                    inf_time = time.time() - start_time
 
-                self.state.update_metrics(pred=prob, fps=fps)
-                stats.record_inference(inf_time)
+                    # Métricas FPS
+                    now = time.time()
+                    inference_count_window.append(now)
+                    inference_count_window = [
+                        t for t in inference_count_window if now - t < 1.0
+                    ]
+                    fps = len(inference_count_window)
 
-                # 4. Lógica de Activación (igual que antes)
-                if prob >= ACTIVATION_THRESHOLD:
-                    if not confirmation_tracker.is_in_cooldown(now):
-                        confirmation_tracker.add_detection(prob, now)
-                        stats.record_detection(prob, confirmed=False)
+                    self.state.update_metrics(pred=prob, fps=fps)
+                    stats.record_inference(inf_time)
 
-                        if confirmation_tracker.is_confirmed():
-                            self.logger.info(
-                                "ACTIVACIÓN CONFIRMADA",
-                                extra={"confidence": float(prob)},
-                            )
-                            print("\n\n>>> ¡JEEPY DETECTADO! <<<\n")
+                    # 4. Lógica de Activación
+                    if prob >= ACTIVATION_THRESHOLD:
+                        if not confirmation_tracker.is_in_cooldown(now):
+                            confirmation_tracker.add_detection(prob, now)
+                            stats.record_detection(prob, confirmed=False)
 
-                            # Aquí iría la lógica de grabación real
-                            # Por ahora simulamos y limpiamos
-                            confirmation_tracker.activate(now)
-                            confirmation_tracker.clear()
+                            if confirmation_tracker.is_confirmed():
+                                self.logger.info(
+                                    "ACTIVACIÓN CONFIRMADA",
+                                    extra={"confidence": float(prob)},
+                                )
+
+                                # TRANSICIÓN A RECORDING
+                                self.state.set_state(STATE_RECORDING)
+                                feedback.signal_listening()
+
+                                # Inicializar buffer de grabación con pre-activación
+                                recording_buffer = [
+                                    pre_activation_buffer.get_buffer_contents()
+                                ]
+                                recording_start_time = current_time
+                                silence_start_time = None
+                                silence_chunks_count = 0
+
+                                print("\n🔴 GRABANDO COMANDO (habla ahora)...\n")
+
+                                confirmation_tracker.activate(now)
+                                confirmation_tracker.clear()
+                    else:
+                        confirmation_tracker.clear_old_detections(now)
+
+            # === ESTADO: RECORDING ===
+            elif current_state == STATE_RECORDING:
+                # Añadir chunk al buffer de grabación
+                recording_buffer.append(chunk.data)
+
+                # Actualizar noise floor incluso durante grabación
+                noise_floor = (0.95 * noise_floor) + (0.05 * chunk.rms)
+
+                # Calcular umbral de silencio (más alto que el umbral de voz normal)
+                silence_threshold = noise_floor * RECORDING_SILENCE_THRESHOLD_MULTIPLIER
+
+                recording_duration = current_time - recording_start_time
+
+                # Detectar silencio
+                if chunk.rms < silence_threshold:
+                    if silence_start_time is None:
+                        silence_start_time = current_time
+                        silence_chunks_count = 1
+                    else:
+                        silence_chunks_count += 1
+
+                    silence_duration = current_time - silence_start_time
+
+                    # Verificar si se cumple el criterio de finalización
+                    if (
+                        silence_duration >= RECORDING_SILENCE_DURATION_SEC
+                        and recording_duration >= RECORDING_MIN_DURATION_SEC
+                    ):
+                        # FIN DE GRABACIÓN POR SILENCIO
+                        self._finish_recording(recording_buffer, feedback, current_time)
+
+                        # TRANSICIÓN A MONITORING
+                        self.state.set_state(STATE_MONITORING)
+                        recording_buffer = []
+
                 else:
-                    confirmation_tracker.clear_old_detections(now)
+                    # Hay voz, resetear contador de silencio
+                    silence_start_time = None
+                    silence_chunks_count = 0
+
+                # Safety timeout: grabación máxima
+                if recording_duration >= RECORDING_MAX_DURATION_SEC:
+                    self.logger.warning(
+                        f"Grabación alcanzó timeout máximo ({RECORDING_MAX_DURATION_SEC}s)"
+                    )
+                    self._finish_recording(recording_buffer, feedback, current_time)
+                    self.state.set_state(STATE_MONITORING)
+                    recording_buffer = []
+
+        # Cleanup
+        feedback.cleanup()
+
+    def _handle_control_command(self, command, stats, confirmation_tracker, feedback):
+        """Procesa comandos de control del sistema"""
+        self.logger.info(f"Comando de control recibido: {command}")
+
+        if command == "stop":
+            print("\n🛑 Sistema detenido por comando de usuario")
+            self.stop_event.set()
+
+        elif command == "pause":
+            self.state.set_paused(True)
+            self.state.set_state(STATE_PAUSED)
+            print("\n⏸️  Sistema pausado")
+
+        elif command == "resume":
+            self.state.set_paused(False)
+            self.state.set_state(STATE_MONITORING)
+            print("\n▶️  Sistema reanudado")
+
+        elif command == "recalibrate":
+            print("\n🔧 Recalibrando umbrales...")
+            confirmation_tracker.clear()
+            # El noise floor se recalibrará automáticamente
+            print("✅ Recalibración completada")
+
+        elif command == "status":
+            self._print_detailed_status(stats)
+
+        elif command == "stats":
+            stats.print_summary(self.logger)
+
+    def _print_detailed_status(self, stats):
+        """Imprime estado detallado del sistema"""
+        print("\n" + "=" * 60)
+        print("📊 ESTADO DETALLADO DEL SISTEMA")
+        print("=" * 60)
+        print(f"Estado actual: {self.state.get_state()}")
+        print(f"Pausado: {self.state.is_paused()}")
+        print(f"FPS: {self.state.fps:.1f}")
+        print(f"CPU: {self.state.cpu:.1f}%")
+        print(f"Nivel de ruido: {self.state.noise_level:.4f}")
+        print(f"Hablando: {self.state.is_speaking}")
+        print(f"\nEstadísticas KWS:")
+        print(f"  Total inferencias: {stats.total_inferences}")
+        print(f"  Detecciones: {stats.detections}")
+        print(f"  Activaciones confirmadas: {stats.confirmed_activations}")
+        print(f"  Falsos positivos: {stats.false_positives}")
+        if stats.detections > 0:
+            print(
+                f"  Tasa de confirmación: {100 * stats.confirmed_activations / stats.detections:.1f}%"
+            )
+        print("=" * 60 + "\n")
+
+    def _finish_recording(self, recording_buffer, feedback, timestamp):
+        """Procesa y guarda el comando grabado"""
+        self.state.set_state(STATE_PROCESSING)
+        feedback.signal_processing()
+
+        # Concatenar todo el audio
+        full_audio = np.concatenate(recording_buffer)
+
+        # Guardar archivo
+        filename = os.path.join(
+            CAPTURED_COMMANDS_DIR, f"cmd_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+        )
+        save_wav_file(full_audio, filename)
+
+        duration = len(full_audio) / SAMPLE_RATE
+        self.logger.info(f"Comando guardado: {filename} ({duration:.2f}s)")
+        print(f"\n✅ Comando guardado: {filename} ({duration:.2f}s)")
+
+        # Procesar con STT si está habilitado
+        if STT_ENABLED and ENABLE_STT_PROCESSING and hasattr(self, "stt_manager"):
+            self._transcribe_command(filename, duration)
+
+        # Pequeña pausa para evitar re-activación
+        time.sleep(0.5)
+
+    def _transcribe_command(self, audio_file, duration):
+        """Transcribe comando de audio a texto y lo procesa con Gemini"""
+        try:
+            self.state.set_state(STATE_TRANSCRIBING)
+            print(f"📝 Transcribiendo comando...")
+
+            # Transcribir usando STTManager
+            transcription = self.stt_manager.transcribe(audio_file)
+
+            if transcription:
+                self.logger.info(f"Transcripción: {transcription}")
+                print(f'\n💬 Transcripción: "{transcription}"\n')
+
+                # Guardar transcripción si está habilitado
+                if STT_SAVE_TRANSCRIPTIONS:
+                    self._save_transcription(audio_file, transcription, duration)
+
+                # Procesar con Gemini si está habilitado
+                if self.gemini_engine and ENABLE_GEMINI_NLU:
+                    self._process_with_gemini(transcription, audio_file)
+
+                # Eliminar audio si está configurado
+                if STT_AUTO_DELETE_AUDIO:
+                    try:
+                        os.remove(audio_file)
+                        self.logger.info(f"Audio eliminado: {audio_file}")
+                    except Exception as e:
+                        self.logger.warning(f"No se pudo eliminar audio: {e}")
+
+                return transcription
+            else:
+                print(f"⚠️ No se pudo transcribir el comando")
+                self.logger.warning("Transcripción falló")
+                return None
+
+        except Exception as e:
+            print(f"❌ Error en transcripción: {e}")
+            self.logger.error(f"Error en transcripción: {e}")
+            return None
+        finally:
+            self.state.set_state(STATE_MONITORING)
+
+    def _save_transcription(self, audio_file, transcription, duration):
+        """Guarda transcripción en archivo"""
+        try:
+            # Crear directorio si no existe
+            os.makedirs(TRANSCRIPTIONS_DIR, exist_ok=True)
+
+            # Generar nombre de archivo (mismo timestamp que el audio)
+            timestamp = (
+                os.path.basename(audio_file).replace("cmd_", "").replace(".wav", "")
+            )
+            txt_filename = os.path.join(TRANSCRIPTIONS_DIR, f"trans_{timestamp}.txt")
+
+            # Guardar con metadata
+            with open(txt_filename, "w", encoding="utf-8") as f:
+                f.write(f"# Transcripción de comando\n")
+                f.write(f"# Audio: {audio_file}\n")
+                f.write(f"# Duración: {duration:.2f}s\n")
+                f.write(f"# Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Motor STT: {Config.STT_ENGINE if STT_ENABLED else 'N/A'}\n")
+                f.write(f"\n{transcription}\n")
+
+            self.logger.info(f"Transcripción guardada: {txt_filename}")
+            print(f"   💾 Guardado en: {txt_filename}")
+
+        except Exception as e:
+            self.logger.error(f"Error guardando transcripción: {e}")
+            print(f"   ⚠️ No se pudo guardar transcripción: {e}")
+
+    def _process_with_gemini(self, transcription, audio_file):
+        """Procesa transcripción con Gemini NLU y ejecuta acción"""
+        try:
+            self.state.set_state(STATE_PROCESSING_NLU)
+            print(f"\n🤖 Procesando con Gemini...\n")
+
+            # Interpretar comando con Gemini
+            result = self.gemini_engine.process_command(transcription)
+
+            if not result:
+                print(f"⚠️ Gemini no pudo interpretar el comando")
+                self.logger.warning("Interpretación Gemini falló")
+                return None
+
+            # Log del resultado
+            self.logger.info(
+                f"Gemini - Acción: {result.get('action')}, Confianza: {result.get('confidence', 0):.2f}"
+            )
+
+            # Ejecutar acción si auto-ejecutar está habilitado
+            if GEMINI_AUTO_EXECUTE and result["action"] != "aclaracion_requerida":
+                execution_result = self.vehicle_controller.execute_action(
+                    result["action"], result.get("parameters", {})
+                )
+                result["execution"] = execution_result
+
+                # Mostrar respuesta natural
+                if result.get("natural_response"):
+                    print(f"\n💬 Jeepy: {result['natural_response']}\n")
+            else:
+                # Solo mostrar qué haría sin ejecutar
+                print(f"   🔍 Acción detectada: {result['action']}")
+                print(
+                    f"   📊 Parámetros: {json.dumps(result.get('parameters', {}), indent=2)}"
+                )
+                if result.get("natural_response"):
+                    print(f"   💬 Respuesta: {result['natural_response']}\n")
+
+            # Guardar resultado si está habilitado
+            if GEMINI_SAVE_RESULTS:
+                self._save_gemini_result(audio_file, transcription, result)
+
+            return result
+
+        except Exception as e:
+            print(f"❌ Error procesando con Gemini: {e}")
+            self.logger.error(f"Error en procesamiento Gemini: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+        finally:
+            self.state.set_state(STATE_MONITORING)
+
+    def _save_gemini_result(self, audio_file, transcription, result):
+        """Guarda resultado de interpretación Gemini"""
+        try:
+            # Crear directorio si no existe
+            os.makedirs(INTERPRETATIONS_DIR, exist_ok=True)
+
+            # Generar nombre de archivo (mismo timestamp que el audio)
+            timestamp = (
+                os.path.basename(audio_file).replace("cmd_", "").replace(".wav", "")
+            )
+            json_filename = os.path.join(
+                INTERPRETATIONS_DIR, f"interpret_{timestamp}.json"
+            )
+
+            # Compilar resultado completo
+            full_result = {
+                "audio_file": audio_file,
+                "transcription": transcription,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "gemini_model": Config.GEMINI_MODEL if GEMINI_ENABLED else "N/A",
+                "interpretation": result,
+            }
+
+            # Guardar como JSON
+            with open(json_filename, "w", encoding="utf-8") as f:
+                json.dump(full_result, f, indent=2, ensure_ascii=False)
+
+            self.logger.info(f"Interpretación guardada: {json_filename}")
+            print(f"   💾 Interpretación guardada: {json_filename}")
+
+        except Exception as e:
+            self.logger.error(f"Error guardando interpretación: {e}")
+            print(f"   ⚠️ No se pudo guardar interpretación: {e}")
 
 
 class SlidingWindowBuffer:
@@ -522,55 +1178,135 @@ def initialize_tflite_interpreter():
         return None, None, None
 
 
-def kws_monitor(device_index):
+def kws_monitor(device_index, interactive=ENABLE_INTERACTIVE_MODE):
     """
-    Bucle principal de monitoreo de audio en vivo con mejoras Fase 2 (Threading).
+    Bucle principal de monitoreo de audio en vivo con mejoras Fases 4-5.
     """
     # 1. INICIALIZACIÓN
     logger = setup_logger(LOG_LEVEL, LOG_FILE)
-    logger.info("Iniciando Monitor KWS Fase 2 (Multithreaded)")
+    logger.info("Iniciando Monitor KWS Mejorado (Fases 1-5)")
 
     audio_queue = queue.Queue(maxsize=QUEUE_SIZE)
     stop_event = threading.Event()
     system_state = SystemState()
 
     # 2. INICIAR HILOS
-    capture_thread = AudioCaptureThread(device_index, audio_queue, stop_event)
+    capture_thread = AudioCaptureThread(
+        device_index, audio_queue, stop_event, system_state
+    )
     inference_thread = InferenceThread(audio_queue, stop_event, system_state, logger)
 
     capture_thread.start()
     inference_thread.start()
 
-    print("\n--- MONITOREO KWS ACTIVO (Multithreaded) ---")
-    print(f"Umbral: {ACTIVATION_THRESHOLD} | VAD Activo")
+    print("\n" + "=" * 70)
+    print("🚗 JEEPY KWS MONITOR - Sistema de Activación por Voz")
+    print("=" * 70)
+    print(f"Umbral de activación: {ACTIVATION_THRESHOLD}")
+    print(f"VAD habilitado | Confirmaciones requeridas: {CONFIRMATION_COUNT}")
+    print(f"Comandos de control habilitados: {ENABLE_CONTROL_COMMANDS}")
+
+    # Mostrar estado de STT
+    if STT_ENABLED and ENABLE_STT_PROCESSING:
+        print(f"🎤 STT habilitado: {Config.STT_ENGINE}")
+        print(f"   Transcripciones: {TRANSCRIPTIONS_DIR}")
+    else:
+        print("ℹ️  STT deshabilitado (solo KWS)")
+
+    if interactive:
+        print("\n💡 Modo interactivo habilitado:")
+        print("   - Escribe 'pause' para pausar")
+        print("   - Escribe 'resume' para continuar")
+        print("   - Escribe 'status' para ver estado detallado")
+        print("   - Escribe 'stats' para ver estadísticas")
+        print("   - Escribe 'recalibrate' para recalibrar")
+        print("   - Escribe 'quit' o Ctrl+C para salir")
+    print("=" * 70 + "\n")
 
     # 3. BUCLE DE MONITOREO PRINCIPAL (UI)
+    if interactive:
+        # Hilo para entrada de comandos
+        def input_worker():
+            while not stop_event.is_set():
+                try:
+                    cmd = input().strip().lower()
+                    if cmd in ["quit", "exit", "q"]:
+                        system_state.send_control_command("stop")
+                    elif cmd in CONTROL_COMMANDS:
+                        system_state.send_control_command(CONTROL_COMMANDS[cmd])
+                    elif cmd in [
+                        "pause",
+                        "resume",
+                        "status",
+                        "stats",
+                        "recalibrate",
+                        "stop",
+                    ]:
+                        system_state.send_control_command(cmd)
+                    elif cmd:
+                        print(f"❓ Comando desconocido: {cmd}")
+                except EOFError:
+                    break
+                except:
+                    pass
+
+        input_thread = threading.Thread(target=input_worker, daemon=True)
+        input_thread.start()
+
     try:
         last_cpu_check = 0
-        while True:
-            time.sleep(0.1)  # Actualización UI a 10Hz
+        last_ui_update = 0
+        ui_update_interval = 0.1  # 10Hz
+
+        while not stop_event.is_set():
+            time.sleep(0.05)
+            current_time = time.time()
 
             # Actualizar CPU periódicamente
-            if time.time() - last_cpu_check > CPU_MONITOR_INTERVAL:
+            if current_time - last_cpu_check > CPU_MONITOR_INTERVAL:
                 cpu = psutil.cpu_percent()
                 system_state.update_metrics(cpu=cpu)
-                last_cpu_check = time.time()
+                last_cpu_check = current_time
 
-            # Imprimir estado
-            print(f"\r{system_state.get_status_string()}", end="")
+            # Actualizar UI
+            if current_time - last_ui_update > ui_update_interval:
+                print(f"\r{system_state.get_status_string()}", end="", flush=True)
+                last_ui_update = current_time
 
             # Verificar salud de hilos
-            if not capture_thread.is_alive() or not inference_thread.is_alive():
-                logger.error("Uno de los hilos ha muerto. Reiniciando sistema...")
+            if not capture_thread.is_alive():
+                logger.error("Hilo de captura murió. Deteniendo sistema...")
+                system_state.set_state(STATE_ERROR)
+                break
+
+            if not inference_thread.is_alive():
+                logger.error("Hilo de inferencia murió. Deteniendo sistema...")
+                system_state.set_state(STATE_ERROR)
+                break
+
+            # Verificar estado de error
+            if system_state.get_state() == STATE_ERROR:
+                logger.error("Sistema en estado de error. Deteniendo...")
                 break
 
     except KeyboardInterrupt:
-        print("\nDeteniendo sistema...")
+        print("\n\n⚠️  Interrupción de usuario detectada...")
     finally:
+        print("\n🛑 Deteniendo sistema...")
         stop_event.set()
-        capture_thread.join(timeout=2.0)
-        inference_thread.join(timeout=2.0)
-        logger.info("Sistema detenido correctamente")
+
+        print("   Esperando hilos...")
+        capture_thread.join(timeout=3.0)
+        inference_thread.join(timeout=3.0)
+
+        if system_state.get_state() == STATE_ERROR:
+            print("❌ Sistema detenido con errores")
+            logger.error("Sistema detenido con errores")
+        else:
+            print("✅ Sistema detenido correctamente")
+            logger.info("Sistema detenido correctamente")
+
+        print()
 
 
 if __name__ == "__main__":
