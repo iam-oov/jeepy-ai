@@ -1,7 +1,7 @@
 [project]
 name = "jeepy-ai"
 version = "0.1.0"
-description = "Add your description here"
+description = "Asistente de voz para control vehicular con Edge ML"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,9 +10,16 @@ dependencies = [
     "librosa>=0.11.0",
     "numpy>=2.3.5",
     "openai>=2.8.1",
+    "openai-whisper>=20250625",
     "psutil>=7.1.3",
     "pyaudio>=0.2.14",
+    "python-dotenv>=1.2.1",
     "scikit-learn>=1.7.2",
     "tensorflow>=2.20.0",
-    "tflite-runtime>=2.14.0",
+    # tflite-runtime solo para Linux/RPi (excluido en macOS)
+    "tflite-runtime>=2.14.0 ; sys_platform != 'darwin'",
 ]
+
+[project.optional-dependencies]
+# Dependencias para desarrollo/testing en macOS (sin tflite-runtime)
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0"]
