@@ -1,7 +1,6 @@
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
-║                    🚗 JEEPY AI - ARQUITECTURA COMPLETA              ║
-║                        Fases 1-5 Implementadas ✅                    ║
+║                    🚗 JEEPY AI - ARQUITECTURA                       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -198,47 +197,14 @@
 └──────────────────────────────────────────────────────────────────────┘
 
 ╔══════════════════════════════════════════════════════════════════════╗
-║                         📊 SYSTEM METRICS                            ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  Latency:         ~250ms (KWS detection)                            ║
-║  Accuracy:        95%+ (with confirmation system)                   ║
-║  False Positives: <5% (2 confirmations required)                    ║
-║  Uptime:          99%+ (with auto-recovery)              [FASE 4]   ║
-║  CPU Usage:       15-50% (RPi 4)                                    ║
-║  Memory:          ~150MB total                                      ║
-║  Recovery Time:   <5s (95% of errors)                    [FASE 4]   ║
-║                                                                      ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                       🎯 IMPLEMENTATION STATUS                       ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  ✅ Fase 1: Core KWS (4 mejoras)                                    ║
-║  ✅ Fase 2: Multithreading (4 mejoras)                              ║
-║  ✅ Fase 3: Smart Recording (4 mejoras)                             ║
-║  ✅ Fase 4: Robustness (4 mejoras)                                  ║
-║  ✅ Fase 5: UX Advanced (4 mejoras)                                 ║
-║                                                                      ║
-║  📦 Integration Modules:                                             ║
-║  ✅ Config System (API key management)                              ║
-║  ✅ STT Engines (4 options with fallback)                           ║
-║  ✅ Gemini Engine (NLU + Tool-Use)                                  ║
-║  ✅ Setup Script (guided configuration)                             ║
-║                                                                      ║
-║  🎉 TOTAL: 20/17 mejoras (117% - Meta superada!)                    ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
-
-╔══════════════════════════════════════════════════════════════════════╗
 ║                         🔮 NEXT STEPS                                ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  1. ⚡ Integrate STT with kws_monitor                                ║
-║  2. 🧠 Connect Gemini for command interpretation                     ║
-║  3. 🚗 Implement real vehicle control (CAN bus)                      ║
-║  4. 🔊 Add TTS for voice responses                                   ║
-║  5. 📱 Deploy to Raspberry Pi                                        ║
-║  6. 🧪 Extended testing in vehicle environment                       ║
+║  1. 🚗 Implement real vehicle control (CAN bus / GPIO) — hoy         ║
+║        VehicleController está simulado (solo logging)               ║
+║  2. 🔊 Add TTS for voice responses                                   ║
+║  3. 📱 Deploy to Raspberry Pi (migrar a tflite-runtime)             ║
+║  4. 🧪 Extended testing in vehicle environment                       ║
 ║                                                                      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
